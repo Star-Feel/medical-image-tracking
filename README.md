@@ -36,17 +36,48 @@ bash ./launch_eval_stir.sh <path/to/STIRDataset> <path/to/weights.pth>
 ```bash
 python ./src/eval/super/eval_super.py -d <path/to/SuPerDataset> -w <path/to/weights.pth>
 ```
+### Unpublished Results on Non-surgical Datasets
+LiteTracker also performs competitively on natural scenes benchmarks.
+
+<table>
+  <tr>
+    <th rowspan="2">Method</th>
+    <th colspan="3">DAVIS</th>
+    <th colspan="3">RGB-S</th>
+    <th colspan="3">Kinetics</th>
+    <th colspan="3">RoboTAP</th>
+    <th colspan="3">Dynamic Replica</th>
+  </tr>
+  <tr>
+    <th>AJ</th><th>δ_avg^vis</th><th>OA</th>
+    <th>AJ</th><th>δ_avg^vis</th><th>OA</th>
+    <th>AJ</th><th>δ_avg^vis</th><th>OA</th>
+    <th>AJ</th><th>δ_avg^vis</th><th>OA</th>
+    <th>δ_avg^occ</th><th>δ_avg^vis</th><th>Surv.</th>
+  </tr>
+  <tr>
+    <td><strong>LiteTracker</strong></td>
+    <td>62.0</td><td>74.6</td><td>88.4</td>
+    <td>71.0</td><td>81.7</td><td>86.7</td>
+    <td>54.4</td><td>66.9</td><td>85.7</td>
+    <td>63.6</td><td>76.7</td><td>87.5</td>
+    <td>38.5</td><td>71.5</td><td>93.9</td>
+  </tr>
+</table>
+
 
 ## Acknowledgements
 Special thanks to the authors of [CoTracker3](https://cotracker3.github.io/), [MFT](https://github.com/serycjon/MFT), [STIR Challenge](https://stir-challenge.github.io/), and [SuPer Framework](https://sites.google.com/ucsd.edu/super-framework/) that made this work possible.
 
 Please cite our work if you use LiteTracker in your research:
 ```
-@article{karaoglu2025litetracker,
-  title={LiteTracker: Leveraging Temporal Causality for Accurate Low-latency Tissue Tracking},
+@inproceedings{karaoglu2025litetracker,
+  title={LiteTracker: Leveraging Temporal Causality for Accurate Low-Latency Tissue Tracking},
   author={Karaoglu, Mert Asim and Ji, Wenbo and Abbas, Ahmed and Navab, Nassir and Busam, Benjamin and Ladikos, Alexander},
-  journal={arXiv preprint arXiv:2504.09904},
-  year={2025}
+  booktitle={International Conference on Medical Image Computing and Computer-Assisted Intervention},
+  pages={308--317},
+  year={2025},
+  organization={Springer}
 }
 ```
 

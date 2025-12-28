@@ -1,8 +1,10 @@
+from time import time
 import torch
 import json
 import numpy as np
 import os
 import cv2
+import datetime
 from pathlib import Path
 import argparse
 from tqdm import tqdm
@@ -78,6 +80,7 @@ def prepare_gt_data(data_dir: Path):
 
 
 def compute_evaluation_metrics(
+    args, 
     location_gt: np.ndarray,
     visibility_gt: np.ndarray,
     location_pred: np.ndarray,
@@ -162,13 +165,21 @@ def compute_evaluation_metrics(
         )
         occlusion_accuracy = num_correct_visibility / total_items
         ajs.append(aj)
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = args.results_dir / f"{timestamp}_{args.model}.log"
+    
+    with open(log_path, "w") as f:
+        f.write(str(args) + "\n")
+        for th, aj in zip(thresholds, ajs):
+            print(f"AJ - {th}px:\t{(aj * 100):.2f}")
+            f.write(f"AJ - {th}px:\t{(aj * 100):.2f}\n")
 
-    for th, aj in zip(thresholds, ajs):
-        print(f"AJ - {th}px:\t{(aj * 100):.2f}")
+        print(f"AJ - Avg:\t{np.mean(ajs) * 100:.2f}")
+        f.write(f"AJ - Avg:\t{np.mean(ajs) * 100:.2f}\n")
 
-    print(f"AJ - Avg:\t{np.mean(ajs) * 100:.2f}")
-
-    print(f"OA:\t{(occlusion_accuracy * 100):.2f}")
+        print(f"OA:\t{(occlusion_accuracy * 100):.2f}")
+        f.write(f"OA:\t{(occlusion_accuracy * 100):.2f}\n")
 
 
 def process_filenames_regex(filenames):
@@ -188,6 +199,9 @@ def process_filenames_regex(filenames):
 
 
 def main(args: argparse.Namespace):
+    if not args.results_dir.exists():
+        os.makedirs(args.results_dir)
+    
     labeled_filenames, location_gt, visibility_gt = prepare_gt_data(
         data_dir=args.data_dir
     )
@@ -210,16 +224,12 @@ def main(args: argparse.Namespace):
     visibility_pred = visibility_control.copy()
 
     pointlist = location_gt[0].copy()
-
+    images = [torch.from_numpy(cv2.cvtColor(cv2.imread(str(args.data_dir / "img" / filename)), cv2.COLOR_BGR2RGB)).unsqueeze(0)  for filename in filenames]
+    
+    start_time = time()
     for i in tqdm(range(len(filenames) - 1)):
-        img0 = cv2.imread(str(args.data_dir / "img" / filenames[i]))
-        img1 = cv2.imread(str(args.data_dir / "img" / filenames[i + 1]))
-
-        img0 = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
-        img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
-
-        img0 = torch.from_numpy(img0).unsqueeze(0)
-        img1 = torch.from_numpy(img1).unsqueeze(0)
+        img0 = images[i]
+        img1 = images[i + 1]
 
         current_location_pred, current_visibility_pred = model.trackpoints2D(
             pointlist, [img0, img1]
@@ -228,6 +238,11 @@ def main(args: argparse.Namespace):
             filename_index = labeled_filenames.index(filenames[i + 1])
             location_pred[filename_index] = current_location_pred
             visibility_pred[filename_index] = current_visibility_pred
+    end_time = time()
+    total_time = end_time - start_time
+    print(f"Total inference time for {len(images)} frames: {total_time:.2f} seconds")
+    print(f"Average inference time per frame: {total_time / len(images) * 1000.0:.4f} ms")
+        
 
     # Calculate the error
     # Drop the initial frame from the evaluation because that is the first frame anyways
@@ -239,7 +254,7 @@ def main(args: argparse.Namespace):
     visibility_control = visibility_control[1:]
 
     compute_evaluation_metrics(
-        location_gt, visibility_gt, location_pred, visibility_pred
+        args, location_gt, visibility_gt, location_pred, visibility_pred
     )
 
 
@@ -256,6 +271,12 @@ if __name__ == "__main__":
         "--weights_path",
         type=Path,
         help="Path to the .pth file containing the model weights",
+    )
+    parser.add_argument(
+        "--model", type=str, default="LiteTracker", help="Model type to use"
+    )
+    parser.add_argument(
+        "--results_dir", type=Path, default="./results/super", help="Directory to save the results"
     )
 
     args = parser.parse_args()

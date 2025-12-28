@@ -16,9 +16,9 @@ try:
 except ImportError:
     pass
 
-import src.eval.stirc_2024.geom_utils as gu
-from src.eval.stirc_2024.rand_utils import tmp_np_seed
-from src.eval.stirc_2024.interpolation import FlowInterpolator
+import geom_utils as gu
+from rand_utils import tmp_np_seed
+from interpolation import FlowInterpolator
 
 GREEN = (0, 255, 0)
 BLUE = (255, 0, 0)

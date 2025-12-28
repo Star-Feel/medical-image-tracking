@@ -441,6 +441,12 @@ class LiteTracker(nn.Module):
             torch.empty(0)
         ] * self.corr_levels  # Track features for matching
 
+        # Kalman filter buffers (per-track)
+        # kf_state: [B, N, 4] representing [x, y, vx, vy] in the downscaled (stride) coordinate frame
+        # kf_cov: [B, N, 4, 4] covariance matrices
+        self.kf_state = torch.empty(0)
+        self.kf_cov = torch.empty(0)
+
         print(f"All the caches are reset.")
 
     def forward(
@@ -563,41 +569,421 @@ class LiteTracker(nn.Module):
             conf_init,
         )
 
-        if self.online_ind == 0:
-            self.ema_flow_buffer = torch.zeros_like(coords_init)
-
-        # Handle tracks that are initialized in the previous frame.
         is_track_previsouly_initialized = (queried_frames < self.online_ind)[
             :, None, :, None
         ]  # B 1 N 1
-        if self.online_ind > 0:
-            vis_init = torch.where(
-                is_track_previsouly_initialized.expand_as(vis_init),
-                self.vis_buffer[:, -1],
-                vis_init,
-            )
-            conf_init = torch.where(
-                is_track_previsouly_initialized.expand_as(conf_init),
-                self.conf_buffer[:, -1],
-                conf_init,
-            )
-            # If there is only one frame processed so far, we initialize the coordinates with the previous frame's coordinates
-            if self.online_ind == 1:
+
+        # Selection of initialization/prediction method for coords_init
+        # Available methods: 'EMA', 'SMA', 'DEMA', 'TEMA', 'KF', 'EKF'
+        # Default preserved below (originally 'SMA') — you can switch to 'KF' or 'EKF' to use Kalman Filter based prediction
+        methods = ''  # change to 'KF' or 'EKF' to use Kalman Filter / Extended Kalman Filter based prediction
+
+        if methods == 'EMA':
+            # Handle tracks that are initialized in the previous frame.
+            if self.online_ind == 0:
+                self.ema_flow_buffer = torch.zeros_like(coords_init)
+            # breakpoint()
+            if self.online_ind > 0:
+                vis_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(vis_init),
+                    self.vis_buffer[:, -1],
+                    vis_init,
+                )
+                conf_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(conf_init),
+                    self.conf_buffer[:, -1],
+                    conf_init,
+                )
+                # If there is only one frame processed so far, we initialize the coordinates with the previous frame's coordinates
+                if self.online_ind == 1:
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1],
+                        coords_init,
+                    )
+                # If there is more, we use the exponential moving average of the flow
+                else:
+                    last_flow = self.coords_buffer[:, -1] - self.coords_buffer[:, -2]
+                    cached_flow = self.ema_flow_buffer
+                    alpha = 0.8
+                    accumulated_flow = alpha * last_flow + (1 - alpha) * cached_flow
+                    self.ema_flow_buffer = accumulated_flow
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1] + accumulated_flow,
+                        coords_init,
+                    )
+        elif methods == 'SMA':
+            N = 20
+            if self.online_ind == 0:
+                self.flow_history_buffer = None
+            if self.online_ind > 0:
+                vis_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(vis_init),
+                    self.vis_buffer[:, -1],
+                    vis_init,
+                )
+                conf_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(conf_init),
+                    self.conf_buffer[:, -1],
+                    conf_init,
+                )
+                # If there is only one frame processed so far, we initialize the coordinates with the previous frame's coordinates
+                if self.online_ind == 1:
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1],
+                        coords_init,
+                    )
+                # If there is more, we use the simple moving average of the recent flows
+                else:
+                    last_flow = self.coords_buffer[:, -1] - self.coords_buffer[:, -2]
+                    if self.flow_history_buffer is None:
+                        self.flow_history_buffer = last_flow.unsqueeze(1)
+                    else:
+                        self.flow_history_buffer = torch.cat([self.flow_history_buffer, last_flow.unsqueeze(1)], dim=1)
+                    if self.flow_history_buffer.shape[1] > N:
+                        self.flow_history_buffer = self.flow_history_buffer[:, 1:]
+                    accumulated_flow = torch.mean(self.flow_history_buffer, dim=1)
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1] + accumulated_flow,
+                        coords_init,
+                    )
+        elif methods == 'DEMA':
+            alpha_dema = 0.8 
+            if self.online_ind == 0:
+                self.ema1_flow_buffer = torch.zeros_like(coords_init)
+                self.ema2_flow_buffer = torch.zeros_like(coords_init)
+            else:
+                vis_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(vis_init),
+                    self.vis_buffer[:, -1],
+                    vis_init,
+                )
+                conf_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(conf_init),
+                    self.conf_buffer[:, -1],
+                    conf_init,
+                )
+                # If there is only one frame processed so far, we initialize the coordinates with the previous frame's coordinates
+                if self.online_ind == 1:
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1],
+                        coords_init,
+                    )
+                else:
+                    last_flow = self.coords_buffer[:, -1] - self.coords_buffer[:, -2]
+
+                    cached_ema1 = self.ema1_flow_buffer
+                    cached_ema2 = self.ema2_flow_buffer
+                    # 1. 计算 EMA1: EMA_1(t) = alpha * F_t + (1 - alpha) * EMA_1(t-1)
+                    current_ema1 = alpha_dema * last_flow + (1 - alpha_dema) * cached_ema1
+                    # 2. 计算 EMA2: EMA_2(t) = alpha * EMA_1(t) + (1 - alpha) * EMA_2(t-1)
+                    current_ema2 = alpha_dema * current_ema1 + (1 - alpha_dema) * cached_ema2
+                    # 3. 计算 DEMA: DEMA_t = 2 * EMA_1(t) - EMA_2(t)
+                    accumulated_flow = 2 * current_ema1 - current_ema2
+                    # 4. 更新缓冲区
+                    self.ema1_flow_buffer = current_ema1
+                    self.ema2_flow_buffer = current_ema2
+                    # 注意：self.ema_flow_buffer 不再使用，或者可以将其设置为 accumulated_flow（DEMA）
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1] + accumulated_flow,
+                        coords_init,
+                    )
+        elif methods == 'TEMA':
+            alpha_tema = 0.8
+            if self.online_ind == 0:
+                self.ema1_flow_buffer = torch.zeros_like(coords_init)
+                self.ema2_flow_buffer = torch.zeros_like(coords_init)
+                self.ema3_flow_buffer = torch.zeros_like(coords_init)
+            else:
+                vis_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(vis_init),
+                    self.vis_buffer[:, -1],
+                    vis_init,
+                )
+                conf_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(conf_init),
+                    self.conf_buffer[:, -1],
+                    conf_init,
+                )
+                # If there is only one frame processed so far, we initialize the coordinates with the previous frame's coordinates
+                if self.online_ind == 1:
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1],
+                        coords_init,
+                    )
+                else:
+                    last_flow = self.coords_buffer[:, -1] - self.coords_buffer[:, -2]
+                    # 从上一步获取缓存值
+                    cached_ema1 = self.ema1_flow_buffer
+                    cached_ema2 = self.ema2_flow_buffer
+                    cached_ema3 = self.ema3_flow_buffer
+                    # 1. 计算 EMA1
+                    current_ema1 = alpha_tema * last_flow + (1 - alpha_tema) * cached_ema1
+                    # 2. 计算 EMA2
+                    current_ema2 = alpha_tema * current_ema1 + (1 - alpha_tema) * cached_ema2
+                    # 3. 计算 EMA3
+                    current_ema3 = alpha_tema * current_ema2 + (1 - alpha_tema) * cached_ema3
+                    # 4. 计算 TEMA: TEMA_t = 3 * EMA_1(t) - 3 * EMA_2(t) + EMA_3(t)
+                    accumulated_flow = 3 * current_ema1 - 3 * current_ema2 + current_ema3
+                    # 5. 更新缓冲区
+                    self.ema1_flow_buffer = current_ema1
+                    self.ema2_flow_buffer = current_ema2
+                    self.ema3_flow_buffer = current_ema3
+                    # 注意：self.ema_flow_buffer 不再使用
+                    coords_init = torch.where(
+                        is_track_previsouly_initialized.expand_as(coords_init),
+                        self.coords_buffer[:, -1] + accumulated_flow,
+                        coords_init,
+                    )
+        elif methods == 'KF':
+            # ----- Windowed Linear Kalman Filter (K = 20) -----
+            # We'll re-run a linear KF over the last K observations (if available) for each track,
+            # then predict one step forward to initialize coords_init for the new frame.
+            K_window = 20
+
+            # KF hyperparameters
+            process_noise = 1e-3
+            measurement_noise = 1e-2
+            P_init_scale = 1.0
+
+            # Prepare matrices
+            F_mat = torch.tensor([[1.0, 0.0, 1.0, 0.0],
+                                  [0.0, 1.0, 0.0, 1.0],
+                                  [0.0, 0.0, 1.0, 0.0],
+                                  [0.0, 0.0, 0.0, 1.0]], device=device, dtype=dtype)  # 4x4
+            H_mat = torch.tensor([[1.0, 0.0, 0.0, 0.0],
+                                  [0.0, 1.0, 0.0, 0.0]], device=device, dtype=dtype)  # 2x4
+            Q_mat = torch.eye(4, device=device, dtype=dtype) * process_noise
+            R_mat = torch.eye(2, device=device, dtype=dtype) * measurement_noise
+            I4 = torch.eye(4, device=device, dtype=dtype)
+
+            # If there's no buffer of previous coords, nothing to do
+            if self.coords_buffer.numel() > 0:
+                T_buf = self.coords_buffer.shape[1]
+                K_use = min(K_window, T_buf)
+                if K_use > 0:
+                    # z_seq: [B, K_use, N, 2] ordered old->new
+                    z_seq = self.coords_buffer[:, -K_use:, :, :].clone()
+
+                    # Build batched matrices
+                    F_batch = F_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 4, 4)
+                    H_batch = H_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 2, 4)
+                    Q_batch = Q_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 4, 4)
+                    R_batch = R_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 2, 2)
+                    I4_batch = I4.unsqueeze(0).unsqueeze(0).expand(B, N, 4, 4)
+
+                    # Initialize x and P from first measurement in the window (so observations drive estimate)
+                    z0 = z_seq[:, 0]  # B N 2
+                    x = torch.zeros((B, N, 4), device=device, dtype=dtype)
+                    x[..., 0:2] = z0
+                    x[..., 2:4] = 0.0
+                    P = torch.stack([torch.eye(4, device=device, dtype=dtype) * P_init_scale] * (B * N)).reshape(B, N, 4, 4)
+
+                    # Run KF through the window (old -> new)
+                    for tt in range(K_use):
+                        z_t = z_seq[:, tt, :, :]  # B N 2
+
+                        # Predict
+                        x = torch.matmul(F_batch, x.unsqueeze(-1)).squeeze(-1)  # B N 4
+                        P = torch.matmul(F_batch, torch.matmul(P, F_batch.transpose(-1, -2))) + Q_batch  # B N 4 4
+
+                        # Update
+                        z_exp = z_t.unsqueeze(-1)  # B N 2 1
+                        y = z_exp - torch.matmul(H_batch, x.unsqueeze(-1))  # B N 2 1
+                        S = torch.matmul(H_batch, torch.matmul(P, H_batch.transpose(-1, -2))) + R_batch  # B N 2 2
+                        S_inv = torch.linalg.inv(S)
+                        K_gain = torch.matmul(P, torch.matmul(H_batch.transpose(-1, -2), S_inv))  # B N 4 2
+
+                        x = x + torch.matmul(K_gain, y).squeeze(-1)  # B N 4
+                        P = torch.matmul(I4_batch - torch.matmul(K_gain, H_batch), P)  # B N 4 4
+
+                    # Apply updates only to tracks that were previously initialized
+                    mask_prev = is_track_previsouly_initialized.squeeze(1).squeeze(-1)  # B N
+                    mask_prev_state = mask_prev.unsqueeze(-1)  # B N 1
+                    mask_prev_cov = mask_prev.unsqueeze(-1).unsqueeze(-1)  # B N 1 1
+
+                    # Ensure kf_state and kf_cov exist with right shape
+                    if (self.kf_state.numel() == 0) or (self.kf_state.shape[0] != B) or (self.kf_state.shape[1] != N):
+                        self.kf_state = torch.zeros((B, N, 4), device=device, dtype=dtype)
+                    if (self.kf_cov.numel() == 0) or (self.kf_cov.shape[0] != B) or (self.kf_cov.shape[1] != N):
+                        self.kf_cov = torch.stack([torch.eye(4, device=device, dtype=dtype) * P_init_scale] * (B * N)).reshape(B, N, 4, 4)
+
+                    self.kf_state = torch.where(mask_prev_state, x, self.kf_state)
+                    self.kf_cov = torch.where(mask_prev_cov, P, self.kf_cov)
+
+                    # Predict one step to next frame
+                    x_next = torch.matmul(F_batch, self.kf_state.unsqueeze(-1)).squeeze(-1)  # B N 4
+                    predicted_pos = x_next[..., 0:2]  # B N 2
+
+                    coords_init = torch.where(
+                        mask_prev.unsqueeze(1).unsqueeze(-1).expand(B, 1, N, 2),
+                        predicted_pos.unsqueeze(1),
+                        coords_init,
+                    )
+        elif methods == 'EKF':
+            # ----- Extended Kalman Filter (EKF) -----
+            # The EKF allows nonlinear process/measurement models.
+            # Here we keep a simple (mostly linear) constant-velocity process model,
+            # but demonstrate nonlinear measurement function:
+            #   f(x) = [x + vx, y + vy, vx, vy]  (linear)
+            #   h(x) = [x + beta * x^2, y + beta * y^2] (nonlinear measurement)
+            #
+            # State: [x, y, vx, vy]
+            # Jacobians are computed analytically and applied in vectorized form.
+
+            # Hyperparameters
+            process_noise = 1e-3
+            measurement_noise = 1e-2
+            P_init_scale = 1.0
+            beta = 1e-3  # small nonlinearity for measurement
+
+            if self.online_ind == 0:
+                # Initialize EKF state/cov
+                self.kf_state = torch.zeros((B, N, 4), device=device, dtype=dtype)
+                self.kf_cov = torch.stack(
+                    [torch.eye(4, device=device, dtype=dtype) * P_init_scale] * (B * N)
+                ).reshape(B, N, 4, 4)
+            else:
+                # Ensure buffers exist and have correct shape
+                if (self.kf_state.numel() == 0) or (self.kf_state.shape[0] != B) or (self.kf_state.shape[1] != N):
+                    self.kf_state = torch.zeros((B, N, 4), device=device, dtype=dtype)
+                if (self.kf_cov.numel() == 0) or (self.kf_cov.shape[0] != B) or (self.kf_cov.shape[1] != N):
+                    self.kf_cov = torch.stack(
+                        [torch.eye(4, device=device, dtype=dtype) * P_init_scale] * (B * N)
+                    ).reshape(B, N, 4, 4)
+
+                mask_prev = is_track_previsouly_initialized.squeeze(1).squeeze(-1)  # B x N (bool)
+
+                # Process model f(x): constant velocity (can be replaced by any differentiable function)
+                # f(x) = [x + vx, y + vy, vx, vy]
+                # Jacobian F_j is constant for this f:
+                F_j = torch.tensor([[1.0, 0.0, 1.0, 0.0],
+                                    [0.0, 1.0, 0.0, 1.0],
+                                    [0.0, 0.0, 1.0, 0.0],
+                                    [0.0, 0.0, 0.0, 1.0]], device=device, dtype=dtype)  # 4x4
+
+                # Measurement model h(x): nonlinear
+                # h(x) = [x + beta * x^2, y + beta * y^2]
+                # Jacobian H_j depends on x:
+                # H = [[1 + 2*beta*x, 0, 0, 0],
+                #      [0, 1 + 2*beta*y, 0, 0]]
+
+                Q_mat = torch.eye(4, device=device, dtype=dtype) * process_noise
+                R_mat = torch.eye(2, device=device, dtype=dtype) * measurement_noise
+                I4 = torch.eye(4, device=device, dtype=dtype)
+
+                if self.online_ind >= 1:
+                    z = self.coords_buffer[:, -1]  # [B, N, 2]
+
+                    if self.online_ind == 1:
+                        # initialize from last measurement
+                        init_state = torch.zeros((B, N, 4), device=device, dtype=dtype)
+                        init_state[..., 0:2] = z
+                        init_state[..., 2:4] = 0.0
+                        init_cov = torch.stack([torch.eye(4, device=device, dtype=dtype) * P_init_scale] * (B * N)).reshape(B, N, 4, 4)
+                        mask_prev_exp = mask_prev.unsqueeze(-1).unsqueeze(-1)  # B N 1 1
+                        self.kf_state = torch.where(mask_prev.unsqueeze(-1), init_state, self.kf_state)
+                        self.kf_cov = torch.where(mask_prev_exp, init_cov, self.kf_cov)
+
+                        # Predict one step with f
+                        x_prev = self.kf_state  # B N 4
+                        x_prev_ = x_prev.unsqueeze(-1)  # B N 4 1
+                        F_batch = F_j.unsqueeze(0).unsqueeze(0).expand(B, N, 4, 4)
+                        x_pred = torch.matmul(F_batch, x_prev_).squeeze(-1)  # B N 4
+                        predicted_pos = x_pred[..., 0:2]  # B N 2
+
+                        coords_init = torch.where(
+                            mask_prev.unsqueeze(1).unsqueeze(-1).expand(B, 1, N, 2),
+                            predicted_pos.unsqueeze(1),
+                            coords_init,
+                        )
+                    else:
+                        # Predict step
+                        x_prev = self.kf_state  # B N 4
+                        P_prev = self.kf_cov  # B N 4 4
+                        x_prev_ = x_prev.unsqueeze(-1)  # B N 4 1
+                        F_batch = F_j.unsqueeze(0).unsqueeze(0).expand(B, N, 4, 4)
+                        Q_batch = Q_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 4, 4)
+                        R_batch = R_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 2, 2)
+
+                        # Predict state with (possibly nonlinear) f; here f is linear so this is simple matmul
+                        x_pred = torch.matmul(F_batch, x_prev_.clone()).squeeze(-1)  # B N 4
+
+                        # Predict covariance
+                        P_pred = torch.matmul(F_batch, torch.matmul(P_prev, F_batch.transpose(-1, -2))) + Q_batch  # B N 4 4
+
+                        # Measurement prediction (nonlinear)
+                        x_pred_xy = x_pred[..., 0:2]  # B N 2
+                        z_pred = torch.stack([
+                            x_pred_xy[..., 0] + beta * x_pred_xy[..., 0] ** 2,
+                            x_pred_xy[..., 1] + beta * x_pred_xy[..., 1] ** 2
+                        ], dim=-1)  # B N 2
+
+                        # Compute Jacobian H_j for each track
+                        # shape B N 2 4
+                        H11 = 1.0 + 2.0 * beta * x_pred_xy[..., 0]
+                        H22 = 1.0 + 2.0 * beta * x_pred_xy[..., 1]
+                        zeros = torch.zeros_like(H11)
+                        H_batch = torch.stack([
+                            torch.stack([H11, zeros, zeros, zeros], dim=-1),
+                            torch.stack([zeros, H22, zeros, zeros], dim=-1),
+                        ], dim=-2)  # B N 2 4
+
+                        # Residual
+                        z_exp = z.unsqueeze(-1)  # B N 2 1
+                        y = z_exp - z_pred.unsqueeze(-1)  # B N 2 1
+
+                        # Innovation covariance
+                        S = torch.matmul(H_batch, torch.matmul(P_pred, H_batch.transpose(-1, -2))) + R_batch  # B N 2 2
+
+                        # Kalman gain
+                        S_inv = torch.linalg.inv(S)  # B N 2 2
+                        K = torch.matmul(P_pred, torch.matmul(H_batch.transpose(-1, -2), S_inv))  # B N 4 2
+
+                        # Update
+                        x_upd = x_pred.unsqueeze(-1) + torch.matmul(K, y)  # B N 4 1
+                        x_upd = x_upd.squeeze(-1)  # B N 4
+
+                        KH = torch.matmul(K, H_batch)  # B N 4 4
+                        P_upd = torch.matmul(I4 - KH, P_pred)  # B N 4 4
+
+                        # Only update masked tracks
+                        mask_prev_exp_state = mask_prev.unsqueeze(-1)  # B N 1
+                        mask_prev_exp_cov = mask_prev.unsqueeze(-1).unsqueeze(-1)  # B N 1 1
+                        self.kf_state = torch.where(mask_prev_exp_state, x_upd, self.kf_state)
+                        self.kf_cov = torch.where(mask_prev_exp_cov, P_upd, self.kf_cov)
+
+                        # Predict one more step to get predicted position for the current (new) frame
+                        x_upd_ = self.kf_state.unsqueeze(-1)  # B N 4 1
+                        x_next_pred = torch.matmul(F_batch, x_upd_).squeeze(-1)  # B N 4
+                        predicted_pos = x_next_pred[..., 0:2]  # B N 2
+
+                        coords_init = torch.where(
+                            mask_prev.unsqueeze(1).unsqueeze(-1).expand(B, 1, N, 2),
+                            predicted_pos.unsqueeze(1),
+                            coords_init,
+                        )
+        else:
+            if self.online_ind > 0:
+                vis_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(vis_init),
+                    self.vis_buffer[:, -1],
+                    vis_init,
+                )
+                conf_init = torch.where(
+                    is_track_previsouly_initialized.expand_as(conf_init),
+                    self.conf_buffer[:, -1],
+                    conf_init,
+                )
                 coords_init = torch.where(
                     is_track_previsouly_initialized.expand_as(coords_init),
                     self.coords_buffer[:, -1],
-                    coords_init,
-                )
-            # If there is more, we use the exponential moving average of the flow
-            else:
-                last_flow = self.coords_buffer[:, -1] - self.coords_buffer[:, -2]
-                cached_flow = self.ema_flow_buffer
-                alpha = 0.8
-                accumulated_flow = alpha * last_flow + (1 - alpha) * cached_flow
-                self.ema_flow_buffer = accumulated_flow
-                coords_init = torch.where(
-                    is_track_previsouly_initialized.expand_as(coords_init),
-                    self.coords_buffer[:, -1] + accumulated_flow,
                     coords_init,
                 )
 

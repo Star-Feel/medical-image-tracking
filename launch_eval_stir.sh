@@ -17,6 +17,7 @@ python src/eval/stirc_2024/write2dgtjson.py \
     --datadir $DATA_DIR
 
 python src/eval/stirc_2024/calculate_error_from_json2d.py \
+    --model $MODEL_TYPE \
     --startgt results/gt_positions_end_all_test.json \
     --endgt results/gt_positions_end_all_test.json \
     --datadir $DATA_DIR \

@@ -12,9 +12,9 @@ import random
 import torch
 import argparse
 from pathlib import Path
-from src.eval.stirc_2024.testutil import *
+from testutil import *
 import logging
-import src.eval.stirc_2024.vis_utils as vu
+import vis_utils as vu
 import csrt
 
 from src.eval.lite_tracker_wrapper import LiteTrackerWrapper
